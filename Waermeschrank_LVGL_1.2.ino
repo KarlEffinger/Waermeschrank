@@ -1,5 +1,3 @@
-/*Find (⇅ for history)
-
  * ============================================================================
  * Wärmeschrank-Steuerung mit LVGL GUI und MQTT
  * ============================================================================
@@ -50,8 +48,6 @@
  * Kontakt: kaeff@gmx.de
  */
 
-// Rotary bei Zeiteinstellung hat zu große Steps reagiert nicht 1:1
-
 // ============================================================================
 // Debugging, für Produktivsystem erste Zeile (#define DEBUG) auskommentieren
 // ============================================================================
@@ -84,7 +80,6 @@
   #include <WebServer.h>               // v3.3.2  Webserver für Konfiguration. Integriert in ESP32-Library
   #include <Preferences.h>             // v3.3.2  Persistente Speicherung (NVS). Integriert in ESP32-Library
   #include <PubSubClient.h>            // v2.8    MQTT-Client. https://github.com/knolleary/pubsubclient/releases/tag/v2.8
-
 
 
 // ============================================================================
@@ -129,7 +124,7 @@
   lv_obj_t *blink_dot;                 // Kleiner blinkender Kreis (grün) im Sekundentakt
 
 // -------------------- GUI: cache / flags für sofortige Updates --------------------
-// Damit die unmittelbaren Updates nicht mit cached internalen Werten in update_gui
+// Damit die unmittelbaren Updates nicht mit gecacheden internen Werten in update_gui
 // kollidieren, speichern wir die zuletzt gezeigten Werte global.
 static int gui_last_sollTemp = -32768;
 static float gui_last_istTemp = -1000.0f;
@@ -257,7 +252,6 @@ static char gui_last_status[64] = "";
   void mqttCallback(char* topic, byte* payload, unsigned int length);
   void rotary_onButtonClick();
   void rotary_loop();
-  void IRAM_ATTR readEncoderISR();
 
 // ============================================================================
 // Interrupt Service Routine für Rotary Encoder samt Button
@@ -448,7 +442,7 @@ void loop() {
   readTemperatureIfReady();          // Messergebnis abholen wenn fertig
   
   // --------------------------------------------------------------------------
-  // Rotary Encoder auslesen (NEUE BIBLIOTHEK)
+  // Rotary Encoder auslesen
   // --------------------------------------------------------------------------
   rotary_loop();
   
@@ -1174,7 +1168,7 @@ void loadConfig() {
  *                false = Nur Solltemperatur speichern (wenn geändert)
  * 
  * Diese Funktion wird aufgerufen:
- * - Automatisch alle 5 Minuten (mitMQTT=false), aber nur falls Solltemperatur geändert
+ * - Automatisch alle 5 Minuten (mitMQTT=false)
  * - Nach Config-Mode Änderungen (mitMQTT=true) - speichert alles
  * 
  * WICHTIG: NVS Flash hat begrenzte Schreibzyklen (~100.000)
@@ -1482,7 +1476,7 @@ void handleSave() {
 /**
  * @brief Stellt Verbindung zum WiFi-Netzwerk her
  * 
- * - Versucht 20x im Abstand von 500ms zu verbinden (= 10 Sekunden max.)
+ * - Versucht 20x im Abstand von 1000ms zu verbinden
  * - Zeigt Fortschritt auf dem Display
  * - Bei Erfolg: IP-Adresse anzeigen
  * - Bei Fehler: Fehlermeldung anzeigen
@@ -1509,11 +1503,11 @@ void connectWiFi() {
   WiFi.begin(wifi_ssid.c_str(), wifi_password.c_str());
   
   // --------------------------------------------------------------------------
-  // Warten auf Verbindung (max. 20 Versuche = 10 Sekunden)
+  // Warten auf Verbindung (max. 20 Versuche = 20 Sekunden)
   // --------------------------------------------------------------------------
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
+    delay(1000);
     attempts++;
     
     // Display-Update alle 2 Versuche (= jede Sekunde)
