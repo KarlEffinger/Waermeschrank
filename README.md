@@ -6,5 +6,7 @@ Sobald die Zieltemperatur das erste Mal erreicht wurde, beginnt die Laufzeit. Wi
 (Dauerhaft, weil aktuell noch eine 2-Punkt-Regelung mit +/- 0.5°C Hysterese und Relaissteuerung implementiert sind. Plan wäre, ggf auf eine PID-Regelung umzustellen).
 
 Auf dem angeschlossenen LCD werden die Soll- und Ist-Temperatur, die Ziel-Laufzeit, die bisherige Laufzeit (auf Zieltemperatur) und die Restlaufzeit angezeigt, verbunden mit dem aktuellen Relaisstatus. Darunter gibt es eine Statuszeile mit Informationen zur WLAN- und MQTT-Verbindung, denn der ESP sendet alle 2 Minuten per MQTT seinen aktuellen Status und kann über eingehende MQTT-Nachrichten auch gesteuert werden.
+![waermeschrank gehaeuse](https://github.com/user-attachments/assets/5a6dba70-e866-4688-830c-4492dedf5e80)
+
 Die Einrichtung der WLAN- und MQTT-Verbindung erfolgt über einen Accesspoint, den der ESP aufspannt, wenn der Taster des Drehgebers länger als 3 Sekunden gedrückt wird.
 
