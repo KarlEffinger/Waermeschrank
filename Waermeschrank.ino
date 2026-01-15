@@ -998,7 +998,7 @@ void gui_force_update_encoder_visuals() {
   if (ist_ms > laufzeit) ist_ms = laufzeit;
 
   unsigned long soll_minutes = laufzeit / 60000UL;
-  unsigned long ist_minutes = (ist_ms == 0) ? 0 : (ist_ms + 60000UL - 1) / 60000UL; // ceil
+  unsigned long ist_minutes = ist_ms / 60000UL;
   unsigned long rest_minutes = (soll_minutes <= ist_minutes) ? 0 : (soll_minutes - ist_minutes);
 
   // Aktualisiere Sollzeit (sofort)
@@ -1281,6 +1281,7 @@ void enterConfigMode() {
   // --------------------------------------------------------------------------
   // Webserver konfigurieren und starten
   // --------------------------------------------------------------------------
+  server.on("/", handleRoot);
   server.on("/save", HTTP_POST, handleSave); // Speichern-Route
   server.begin();
   tft.setCursor(10, 180);
