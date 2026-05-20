@@ -1790,14 +1790,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       }
       
       DPRINTF("Solltemperatur via MQTT geaendert: %d C\n", sollTemp);
+
+      // Bestätigung senden
+      publishMQTTData();
       
-      // Bestätigung zurücksenden
-      char buf[10];
-      snprintf(buf, sizeof(buf), "%d", sollTemp);
-      bool success = mqttClient.publish((mqtt_topic_base + "/temp_soll").c_str(), buf);
-      DPRINTF("Temp Soll: %s -> %s\n", buf, success ? "OK" : "FEHLER");
-      // HINWEIS: Speicherung erfolgt automatisch beim nächsten Auto-Save
-      // (alle 5 Minuten in loop())
     } else {
       // Ungültiger Wert
       DPRINTF("FEHLER: Solltemperatur %d ausserhalb 20-60 C\n", newTemp);
@@ -1821,13 +1817,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       
       DPRINTF("Laufzeit via MQTT geaendert: %d Minuten (%lu ms)\n", 
                     newMinutes, laufzeit);
+
+      // Bestätigung senden
+      publishMQTTData();                    
       
-      // Bestätigung zurücksenden
-      char buf[20];
-      snprintf(buf, sizeof(buf), "%d", newMinutes);
-      bool success = mqttClient.publish((mqtt_topic_base + "/laufzeit_min").c_str(), buf);
-      DPRINTF("Laufzeit: %s -> %s\n", buf, success ? "OK" : "FEHLER");
-      // HINWEIS: Laufzeit wird NICHT gespeichert (nur Solltemperatur wird persistiert)
     } else {
       // Ungültiger Wert
       DPRINTF("FEHLER: Laufzeit %d Minuten ausserhalb 0-5940 min (0-99h)\n", 
