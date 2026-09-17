@@ -10,3 +10,5 @@ Auf dem angeschlossenen LCD werden die Soll- und Ist-Temperatur, die Ziel-Laufze
 
 Die Einrichtung der WLAN- und MQTT-Verbindung erfolgt über einen Accesspoint, den der ESP aufspannt, wenn der Taster des Drehgebers länger als 3 Sekunden gedrückt wird.
 
+Der Wärmeschrank meldet sich bei Home Assistant per MQTT Discovery selbst an: sobald er sich mit dem MQTT-Broker verbindet, legt er automatisch ein Gerät mit den Entities Relais, Solltemperatur, Ist-Temperatur, Solllaufzeit und Restlaufzeit an (inkl. Availability, d.h. HA zeigt an, ob das Gerät online ist).
+

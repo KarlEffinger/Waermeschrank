@@ -22,17 +22,35 @@
  * - Encoder drehen: Wert ändern (je nach Modus)
  * 
  * MQTT Topics:
- * - [base]/temp_ist        : Aktuelle Temperatur (wird gesendet)
- * - [base]/temp_soll       : Solltemperatur (wird gesendet und empfangen)
- * - [base]/relay           : Relaisstatus (wird gesendet)
+ * - [base]/temp_ist        : Aktuelle Temperatur (wird gesendet, retained)
+ * - [base]/temp_soll       : Solltemperatur (wird gesendet und empfangen, retained)
+ * - [base]/relay           : Relaisstatus (wird gesendet, retained)
+ * - [base]/sollLaufzeit    : Solllaufzeit in ms (wird gesendet, retained)
+ * - [base]/restLaufzeit    : Restlaufzeit in ms (wird gesendet, retained)
  * - [base]/set_temp_soll   : Solltemperatur setzen (Empfang)
  * - [base]/set_laufzeit    : Laufzeit setzen in Minuten (Empfang)
- * - [base]/laufzeit_min    : Laufzeit Bestätigung (wird gesendet)
- * 
+ * - [base]/status          : Availability "online"/"offline" (retained, Last Will and Testament)
+ *
+ * Home Assistant MQTT Discovery:
+ * - Beim Verbinden wird fuer jede Entity eine retained Config-Nachricht nach
+ *   homeassistant/<component>/<geraete-id>/<object_id>/config veroeffentlicht.
+ * - <geraete-id> ist eine aus der Chip-ID abgeleitete, stabile Kennung (siehe
+ *   haDeviceId in setup()) - unabhaengig vom hier konfigurierbaren [base]-Topic.
+ *   Aendert sich [base] (z.B. ueber die Web-Konfiguration), bleiben die
+ *   HA-Entities dadurch erhalten; nur die referenzierten Topics im
+ *   Config-Payload werden beim naechsten Verbindungsaufbau aktualisiert.
+ *
  * Autor: Karl Effinger
  *
  * Change log
  *
+ * v1.3.0 - 2026-09-17 - Taster-Debounce ueberarbeitet (ISR-Timestamp statt
+ *                       Race-anfaelligem digitalRead), MQTT-Connect-Timeout
+ *                       (2s), non-blocking WiFi-Reconnect, lv_refr_now/
+ *                       lv_tick_inc/millis-Overflow-Fixes, WiFi.setSleep(false),
+ *                       MQTT Availability (LWT) + retained Publishes,
+ *                       Home Assistant MQTT Discovery (5 Entities, stabile
+ *                       Geraete-ID aus Chip-ID)
  * v1.2.0 - 2025-11-13 - Zeiteinstellung umgestellt, GUI überarbeitet
  * v1.1.0 - 2025-11-11 - Umstellung auf AiEsp32RotaryEncoder Bibliothek
  * v1.0.0 - 2025-11-06 - Finale Version mit Kommentaren
@@ -165,10 +183,14 @@ static char gui_last_status[64] = "";
   int encoderMode = 0;                 // 0=Temperatur, 1=Laufzeit
   bool configModeRequested = false;    // Flag: Config-Modus angefordert, nach >3 Sekunden Tastendruck (siehe LONG_PRESS_TIME)
 
-  volatile bool buttonStateChanged = false;  // ISR-sicheres Flag
-  volatile unsigned long lastButtonChange = 0;
-  const unsigned long DEBOUNCE_DELAY = 50;   // 50ms Entprellung
-  
+  // Button-Erfassung: die ISR haelt nur den zuletzt gesehenen Pegel + Zeitstempel fest
+  // (kein digitalRead() im Loop noetig). Die eigentliche Entprellung (Pegel muss
+  // DEBOUNCE_DELAY ms stabil sein) passiert in rotary_loop(). Dadurch gehen Flanken
+  // nicht verloren, auch wenn loop() mal kurz blockiert (z.B. MQTT-Connect-Versuch).
+  volatile bool isrButtonLevel = HIGH;
+  volatile unsigned long isrLevelChangeTime = 0;
+  const unsigned long DEBOUNCE_DELAY = 30;   // 30ms Entprellung (wie AiEsp32RotaryEncoder intern)
+
   // Button-Timing für langen Tastendruck
   unsigned long buttonPressStartTime = 0;
   bool buttonWasPressed = false;
@@ -206,12 +228,23 @@ static char gui_last_status[64] = "";
   // WiFi-Zugangsdaten (werden aus NVS geladen)
   String wifi_ssid = "";
   String wifi_password = "";
+
+  // WiFi Reconnect-Logik (non-blocking, im Gegensatz zu MQTT KEIN Abschalten nach
+  // X Fehlversuchen - eine WLAN-Unterbrechung (z.B. Router-Neustart) soll das
+  // Geraet nicht dauerhaft offline lassen).
+    unsigned long lastWifiReconnectAttempt = 0;      // Zeitpunkt des letzten Versuchs
+    const unsigned long wifiReconnectCooldown = 30 * 1000; // Pause zwischen Versuchen: 30 Sekunden
+
   // MQTT-Verbindungsdaten (werden aus NVS geladen)
   String mqtt_server = "";
   int mqtt_port = 1883;
   String mqtt_user = "";
   String mqtt_password = "";
   String mqtt_topic_base = "waermeschrank";  // Basis-Topic für alle MQTT-Nachrichten
+
+  // Home Assistant Discovery: stabile Geraete-ID aus der Chip-ID (unabhaengig
+  // von mqtt_topic_base). Wird einmalig in setup() befuellt.
+  String haDeviceId = "";
 
   // MQTT Publish-Timing
     unsigned long lastMqttPublish = 0;   // Zeitpunkt des letzten MQTT-Publish
@@ -249,6 +282,7 @@ static char gui_last_status[64] = "";
   void connectWiFi();
   void reconnectMQTT();
   void publishMQTTData();
+  void publishHADiscovery();
   void mqttCallback(char* topic, byte* payload, unsigned int length);
   void rotary_onButtonClick();
   void rotary_loop();
@@ -264,12 +298,14 @@ void IRAM_ATTR readEncoderISR() {
   rotaryEncoder.readEncoder_ISR();
 }
 
+/**
+ * @brief ISR fuer den Taster - haelt nur Pegel + Zeitstempel fest, keine Logik.
+ * Feuert bei jeder Flanke (CHANGE), auch waehrend loop() durch einen blockierenden
+ * Aufruf (z.B. mqttClient.connect()) angehalten ist.
+ */
 void IRAM_ATTR buttonISR() {
-  unsigned long now = millis();
-  if (now - lastButtonChange > DEBOUNCE_DELAY) {
-    buttonStateChanged = true;
-    lastButtonChange = now;
-  }
+  isrButtonLevel = digitalRead(ROTARY_ENCODER_BUTTON_PIN);
+  isrLevelChangeTime = millis();
 }
 
 
@@ -350,9 +386,14 @@ void setup() {
   // --------------------------------------------------------------------------
   rotaryEncoder.begin();
   rotaryEncoder.setup(readEncoderISR);
-  pinMode(ROTARY_ENCODER_BUTTON_PIN, INPUT); // habe einen 10k Pull-Up Widerstand am Button!
+  // HINWEIS: rotaryEncoder.begin() setzt den Taster-Pin bereits auf INPUT_PULLUP
+  // (isButtonPulldown=false, Standard). Das NICHT mehr auf INPUT umstellen - sonst
+  // haengt der Pegel vom externen 10k-Pull-Up ab, statt vom internen (stabileren).
   attachInterrupt(digitalPinToInterrupt(ROTARY_ENCODER_BUTTON_PIN), buttonISR, CHANGE);
-  
+  // Anfangszustand für die Entprellung synchronisieren
+  isrButtonLevel = digitalRead(ROTARY_ENCODER_BUTTON_PIN);
+  isrLevelChangeTime = millis();
+
   // Grenzen für Temperatur-Modus setzen (20-60°C)
   rotaryEncoder.setBoundaries(20, 60, false); // minValue, maxValue, circleValues
   rotaryEncoder.setAcceleration(100); // Beschleunigung beim schnellen Drehen (optional)
@@ -377,8 +418,32 @@ void setup() {
     
     // MQTT konfigurieren und verbinden (falls WiFi erfolgreich)
     if (mqtt_server.length() > 0 && WiFi.status() == WL_CONNECTED) {
+      // Stabile Geraete-ID fuer Home Assistant Discovery aus der Chip-ID
+      // ableiten (ESP.getEfuseMac() liefert die 48-Bit Werks-MAC in einem
+      // uint64_t). Bewusst NICHT von mqtt_topic_base abhaengig, damit HA die
+      // Entities bei einer Topic-Umbenennung nicht als neues Geraet anlegt.
+      uint64_t chipMac = ESP.getEfuseMac();
+      char haDeviceIdBuf[13];
+      snprintf(haDeviceIdBuf, sizeof(haDeviceIdBuf), "%04X%08X",
+               (unsigned int)(chipMac >> 32), (unsigned int)chipMac);
+      haDeviceId = String(haDeviceIdBuf);
+
+      // TCP-Connect-Timeout des underlying WiFiClient begrenzen: ohne das kann
+      // mqttClient.connect() bei nicht erreichbarem Broker mehrere Sekunden
+      // blockieren. 2s deckelt den Worst Case in reconnectMQTT(), das spaeter
+      // zyklisch aus loop() aufgerufen wird.
+      // WICHTIG: setTimeout() waere hier falsch - das setzt nur den Stream-
+      // Lesetimeout (Client::setTimeout), nicht den Connect-Timeout!
+      espClient.setConnectionTimeout(2000);
       mqttClient.setServer(mqtt_server.c_str(), mqtt_port);
       mqttClient.setCallback(mqttCallback); // Callback für eingehende Nachrichten
+
+      // Puffer vergroessern: Der PubSubClient-Default (256 Byte) reicht nicht
+      // fuer die Home-Assistant-Discovery-Config-Payloads (JSON mit Device-Block).
+      if (!mqttClient.setBufferSize(1024)) {
+        DPRINTLN("WARNUNG: MQTT-Puffer konnte nicht auf 1024 Byte vergroessert werden!");
+      }
+
       delay(500);
       reconnectMQTT();
       
@@ -422,16 +487,17 @@ void loop() {
   }
   
   // --------------------------------------------------------------------------
-  // LVGL Zeitbasis aktualisieren (alle 5ms)
+  // LVGL Zeitbasis aktualisieren (tatsaechlich vergangene Zeit, nicht fix 5ms)
   // --------------------------------------------------------------------------
   static unsigned long lv_last_tick = 0;
   unsigned long now = millis();
   if (lv_last_tick == 0) lv_last_tick = now;
-  if (now - lv_last_tick >= 5) {
-    lv_tick_inc(5);                   // LVGL mitteilen, dass 5ms vergangen sind
-    lv_last_tick += 5;
+  unsigned long lv_elapsed = now - lv_last_tick; // unsigned-Subtraktion: overflow-sicher
+  if (lv_elapsed >= 5) {
+    lv_tick_inc(lv_elapsed);          // LVGL die wirklich vergangene Zeit mitteilen
+    lv_last_tick = now;               // (nicht += 5, sonst summiert sich die Drift auf)
   }
-  
+
   lv_task_handler();                  // LVGL Tasks verarbeiten
   delay(5);                           // Kurze Pause für Task-Scheduler
   
@@ -446,12 +512,11 @@ void loop() {
   // --------------------------------------------------------------------------
   rotary_loop();
   
-  // Overflow-Schutz: Wenn millis() kleiner als startTime ist, neu initialisieren
-  // passiert nur, wenn das Gerät über 48 Tage läuft...
-  if (startTime > 0 && millis() < startTime) {
-      DPRINTLN("millis() Overflow erkannt - Timer zurückgesetzt");
-      startTime = millis();  // Timer neu starten
-  }
+  // HINWEIS: Kein separater millis()-Overflow-Schutz nötig - alle Laufzeit-
+  // Vergleiche unten nutzen bereits das Muster "millis() - startTime >= laufzeit"
+  // mit unsigned-Subtraktion, das ist beim Wrap nach ~49,7 Tagen automatisch
+  // korrekt. Ein expliziter "millis() < startTime"-Check wuerde in genau diesem
+  // Fenster faelschlich die bereits korrekt gezaehlte Laufzeit verwerfen.
 
   // --------------------------------------------------------------------------
   // Relais-Steuerung mit Hysterese und Laufzeitüberwachung
@@ -513,6 +578,22 @@ void loop() {
     DPRINTLN("Relais wegen Sensor-Fehler ausgeschaltet!");
   }
   
+  // --------------------------------------------------------------------------
+  // WiFi-Verbindung überwachen und bei Abbruch non-blocking neu verbinden
+  // --------------------------------------------------------------------------
+  // Anders als bei MQTT: keine dauerhafte Abschaltung nach X Versuchen - eine
+  // WLAN-Unterbrechung (Router-Neustart, kurze Stoerung) soll das Geraet nicht
+  // bis zum naechsten Stromzyklus offline lassen. WiFi.reconnect() blockiert
+  // nicht (im Gegensatz zu connectWiFi(), das haben wir hier bewusst nicht
+  // wiederverwendet).
+  if (wifi_ssid.length() > 0 && WiFi.status() != WL_CONNECTED) {
+    if (millis() - lastWifiReconnectAttempt >= wifiReconnectCooldown) {
+      DPRINTLN("WiFi nicht verbunden - Reconnect-Versuch...");
+      WiFi.reconnect();
+      lastWifiReconnectAttempt = millis();
+    }
+  }
+
   // --------------------------------------------------------------------------
   // MQTT Verbindung aufrechterhalten
   // --------------------------------------------------------------------------
@@ -661,40 +742,58 @@ void rotary_loop() {
   }
   
   // --------------------------------------------------------------------------
-  // BUTTON-ERKENNUNG (ISR-getriggert)
+  // BUTTON-ERKENNUNG (Entprellung ueber ISR-Zeitstempel, kein digitalRead() hier)
   // --------------------------------------------------------------------------
-  if (buttonStateChanged) {
-    buttonStateChanged = false;  // Flag zurücksetzen
-    
-    bool isPressed = (digitalRead(ROTARY_ENCODER_BUTTON_PIN) == LOW);
-    
-    if (isPressed && !buttonWasPressed) {
-      // Button wurde gedrückt
-      buttonWasPressed = true;
-      buttonPressStartTime = millis();
-      DPRINTLN("Button DOWN");
-    }
-    else if (!isPressed && buttonWasPressed) {
-      // Button wurde losgelassen
-      unsigned long pressDuration = millis() - buttonPressStartTime;
-      buttonWasPressed = false;
-      
-      DPRINTF("Button UP (Dauer: %lu ms)\n", pressDuration);
-      
-      // Plausibilitätsprüfung
-      if (pressDuration > 60000UL) {
-        DPRINTLN("Unrealistische Dauer -> ignoriert");
-        return;
+  // lastLevel/lastChangeTime: letzter als "akzeptiert" gewerteter Pegelwechsel.
+  // debouncedPressed: aktueller entprellter Zustand.
+  static bool lastLevel = HIGH;
+  static unsigned long lastChangeTime = 0;
+  static bool debouncedPressed = false;
+
+  // Konsistente Momentaufnahme der beiden ISR-Werte (Reihenfolge: erst Zeit, dann
+  // Pegel lesen waere auch ok - im schlimmsten Fall ist die Bewertung um einen
+  // Entprell-Zyklus verzoegert, nie falsch).
+  bool level = isrButtonLevel;
+  unsigned long changeTime = isrLevelChangeTime;
+
+  if (level != lastLevel) {
+    // Neue Flanke von der ISR gesehen -> Entprell-Timer auf deren Zeitstempel setzen
+    lastLevel = level;
+    lastChangeTime = changeTime;
+  }
+
+  if ((millis() - lastChangeTime) >= DEBOUNCE_DELAY) {
+    bool isPressed = (lastLevel == LOW);
+
+    if (isPressed != debouncedPressed) {
+      debouncedPressed = isPressed;
+
+      if (isPressed && !buttonWasPressed) {
+        // Button wurde gedrückt
+        buttonWasPressed = true;
+        buttonPressStartTime = millis();
+        DPRINTLN("Button DOWN");
       }
-      
-      if (pressDuration > LONG_PRESS_TIME) {
-        // Langer Druck -> Config-Mode
-        configModeRequested = true;
-        DPRINTLN("==> Config-Mode angefordert");
-      } 
-      else if (pressDuration > DEBOUNCE_DELAY) {
-        // Kurzer Druck -> Mode wechseln
-        rotary_onButtonClick();
+      else if (!isPressed && buttonWasPressed) {
+        // Button wurde losgelassen
+        unsigned long pressDuration = millis() - buttonPressStartTime;
+        buttonWasPressed = false;
+
+        DPRINTF("Button UP (Dauer: %lu ms)\n", pressDuration);
+
+        // Plausibilitätsprüfung
+        if (pressDuration > 60000UL) {
+          DPRINTLN("Unrealistische Dauer -> ignoriert");
+        }
+        else if (pressDuration > LONG_PRESS_TIME) {
+          // Langer Druck -> Config-Mode
+          configModeRequested = true;
+          DPRINTLN("==> Config-Mode angefordert");
+        }
+        else if (pressDuration > DEBOUNCE_DELAY) {
+          // Kurzer Druck -> Mode wechseln
+          rotary_onButtonClick();
+        }
       }
     }
   }
@@ -1056,9 +1155,12 @@ void gui_force_update_encoder_visuals() {
     gui_lastRelayOn = relayOn;
   }
 
-  // 5) Optional: erzwinge sofortiges Redraw (falls auf dem Gerät sichtbar verzögert)
-  // lv_refr_now(NULL) ist relativ teuer, aber für einzelne User-Events akzeptabel.
-  lv_refr_now(NULL);
+  // HINWEIS: Kein lv_refr_now(NULL) hier mehr - diese Funktion laeuft bei JEDEM
+  // Encoder-Schritt (nicht nur bei einem einzelnen User-Event), und lv_refr_now()
+  // erzwingt einen sofortigen synchronen SPI-Redraw. Bei schnellem Drehen (mit
+  // Acceleration mehrfach pro loop()-Durchlauf) summiert sich das spuerbar auf.
+  // lv_task_handler() in loop() zeichnet die oben geaenderten Labels ohnehin
+  // innerhalb von ein paar ms - ohne den Zwangs-Redraw hier.
 }
 
 
@@ -1434,7 +1536,14 @@ void handleSave() {
   if (server.hasArg("mqtt_port")) mqtt_port = server.arg("mqtt_port").toInt();
   if (server.hasArg("mqtt_user")) mqtt_user = server.arg("mqtt_user");
   if (server.hasArg("mqtt_pass")) mqtt_password = server.arg("mqtt_pass");
-  if (server.hasArg("mqtt_topic")) mqtt_topic_base = server.arg("mqtt_topic");
+  if (server.hasArg("mqtt_topic")) {
+    mqtt_topic_base = server.arg("mqtt_topic");
+    // '"' und '\' entfernen: mqtt_topic_base wird roh in die JSON-Payloads
+    // der HA-Discovery eingebettet (publishHADiscovery()) - ohne diese
+    // Bereinigung wuerde eines dieser Zeichen im Topic-Namen das JSON zerstoeren.
+    mqtt_topic_base.replace("\"", "");
+    mqtt_topic_base.replace("\\", "");
+  }
   
   // --------------------------------------------------------------------------
   // Alle Werte in NVS Flash speichern
@@ -1501,8 +1610,12 @@ void connectWiFi() {
   // WiFi im Station-Modus starten
   // --------------------------------------------------------------------------
   WiFi.mode(WIFI_STA);
+  // Geraet haengt am Netzteil - WiFi-Modem-Sleep bringt hier nur Nachteile
+  // (zusaetzliche Latenz bei eingehenden Paketen, potenziell weniger stabile
+  // Verbindung), Stromsparen ist irrelevant.
+  WiFi.setSleep(false);
   WiFi.begin(wifi_ssid.c_str(), wifi_password.c_str());
-  
+
   // --------------------------------------------------------------------------
   // Warten auf Verbindung (max. 20 Versuche = 20 Sekunden)
   // --------------------------------------------------------------------------
@@ -1605,16 +1718,21 @@ void reconnectMQTT() {
   // MQTT Verbindung aufbauen
   // --------------------------------------------------------------------------
   String clientId = mqtt_topic_base; // Client-ID = Topic-Basis
-  
+  String topic_status = mqtt_topic_base + "/status"; // Availability-Topic (LWT)
+
   bool connected;
   if (mqtt_user.length() > 0) {
-    // Mit Authentifizierung
-    connected = mqttClient.connect(clientId.c_str(), 
-                                   mqtt_user.c_str(), 
-                                   mqtt_password.c_str());
+    // Mit Authentifizierung + Last Will and Testament (status=offline, retained)
+    // Der Broker publiziert dies automatisch, wenn die Verbindung ohne
+    // saubere Trennung abbricht (Stromausfall, WLAN-Verlust, Absturz).
+    connected = mqttClient.connect(clientId.c_str(),
+                                   mqtt_user.c_str(),
+                                   mqtt_password.c_str(),
+                                   topic_status.c_str(), 0, true, "offline");
   } else {
-    // Ohne Authentifizierung
-    connected = mqttClient.connect(clientId.c_str());
+    // Ohne Authentifizierung + Last Will and Testament (status=offline, retained)
+    connected = mqttClient.connect(clientId.c_str(),
+                                   topic_status.c_str(), 0, true, "offline");
   }
   
   delay(100); // Kurze Pause nach Verbindungsversuch
@@ -1626,7 +1744,17 @@ void reconnectMQTT() {
     // Verbindung erfolgreich
     DPRINTLN("=== MQTT verbunden! ===");
     mqttReconnectAttempts = 0; // Fehlerzähler zurücksetzen
-    
+
+    // Availability: "online" retained publizieren, damit Home Assistant
+    // den Zustand auch nach einem HA-Neustart sofort korrekt anzeigt.
+    mqttClient.publish(topic_status.c_str(), "online", true);
+
+    // Home Assistant Discovery: Entity-Configs (retained) veroeffentlichen.
+    // Passiert bei jedem Connect erneut - kostet wenig und macht die
+    // Entities selbstheilend, falls der Broker seine retained Messages
+    // verliert oder HA neu eingerichtet wird.
+    publishHADiscovery();
+
     // Topics abonnieren für Fernsteuerung
     String topic_temp = mqtt_topic_base + "/set_temp_soll";
     String topic_zeit = mqtt_topic_base + "/set_laufzeit";
@@ -1698,25 +1826,25 @@ void publishMQTTData() {
   // Relaisstatus publishen
   // --------------------------------------------------------------------------
   snprintf(buf, sizeof(buf), "%s", relayOn ? "ON" : "OFF");
-  success = mqttClient.publish((mqtt_topic_base + "/relay").c_str(), buf);
-  
+  success = mqttClient.publish((mqtt_topic_base + "/relay").c_str(), buf, true);
+
   // --------------------------------------------------------------------------
   // Solltemperatur publishen
   // --------------------------------------------------------------------------
   snprintf(buf, sizeof(buf), "%d", sollTemp);
-  success = mqttClient.publish((mqtt_topic_base + "/temp_soll").c_str(), buf);
-  
+  success = mqttClient.publish((mqtt_topic_base + "/temp_soll").c_str(), buf, true);
+
   // --------------------------------------------------------------------------
   // Ist-Temperatur publishen (mit 1 Dezimalstelle)
   // --------------------------------------------------------------------------
   snprintf(buf, sizeof(buf), "%.1f", istTemp);
-  success = mqttClient.publish((mqtt_topic_base + "/temp_ist").c_str(), buf);
+  success = mqttClient.publish((mqtt_topic_base + "/temp_ist").c_str(), buf, true);
 
   // --------------------------------------------------------------------------
   // Soll-Laufzeit publishen (in Millisekunden)
   // --------------------------------------------------------------------------
   snprintf(buf, sizeof(buf), "%lu", laufzeit);
-  success = mqttClient.publish((mqtt_topic_base + "/sollLaufzeit").c_str(), buf);
+  success = mqttClient.publish((mqtt_topic_base + "/sollLaufzeit").c_str(), buf, true);
 
   // --------------------------------------------------------------------------
   // Rest-Laufzeit publishen (in Millisekunden)
@@ -1731,8 +1859,109 @@ void publishMQTTData() {
     rest_ms = (elapsed >= laufzeit) ? 0 : (laufzeit - elapsed);
   }
   snprintf(buf, sizeof(buf), "%lu", rest_ms);
-  success = mqttClient.publish((mqtt_topic_base + "/restLaufzeit").c_str(), buf);
+  success = mqttClient.publish((mqtt_topic_base + "/restLaufzeit").c_str(), buf, true);
   //DPRINTF("MQTT: Relay %s, Soll-Temp %d, Ist-Temp %.1f, Solllaufzeit %lu, Rest %lu", relayOn ? "ON" : "OFF", sollTemp, istTemp, laufzeit, rest_ms);
+}
+
+// ============================================================================
+// MQTT: Home Assistant Discovery
+// ============================================================================
+/**
+ * @brief Veroeffentlicht die MQTT-Discovery-Config fuer alle Entities
+ *
+ * Legt in Home Assistant automatisch ein Geraet "Wärmeschrank" mit 5
+ * Entities an (bzw. aktualisiert sie): Relais, Solltemperatur, Ist-
+ * Temperatur, Solllaufzeit, Restlaufzeit. Wird aus reconnectMQTT() nach
+ * jedem erfolgreichen Connect aufgerufen.
+ *
+ * Alle Config-Topics basieren auf haDeviceId (stabile, aus der Chip-ID
+ * abgeleitete Kennung), NICHT auf mqtt_topic_base - siehe Kommentar am
+ * Dateianfang. Die referenzierten State-/Command-Topics im Payload
+ * verwenden weiterhin mqtt_topic_base.
+ *
+ * Laufzeit-Werte liegen auf den normalen Topics weiterhin in Millisekunden
+ * vor (siehe publishMQTTData()); fuer die Anzeige in HA rechnet ein
+ * value_template (val_tpl) im Discovery-Payload nach Minuten um, ohne dass
+ * die Rohtopics selbst geaendert werden muessen.
+ *
+ * Feldabkuerzungen (uniq_id, stat_t, cmd_t, unit_of_meas, dev_cla, avty_t,
+ * pl_avail/pl_not_avail, val_tpl, dev/ids/mf/mdl) sind offizielle Home
+ * Assistant MQTT-Discovery-Abkuerzungen (siehe abbreviations.py im
+ * home-assistant/core Repo) - keine Freihand-Namen.
+ */
+void publishHADiscovery() {
+  // Gemeinsame Bausteine, die in jede Entity-Config eingebettet werden
+  String avail = "\"avty_t\":\"" + mqtt_topic_base + "/status\","
+                 "\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\"";
+  String dev = "\"dev\":{\"ids\":[\"" + haDeviceId + "\"],\"name\":\"Wärmeschrank\","
+               "\"mf\":\"DIY\",\"mdl\":\"ESP32 Wärmeschrank\"}";
+
+  char topic[100];
+  char payload[600];
+  int n;
+
+  // --------------------------------------------------------------------------
+  // Entity: Relais-Status (binary_sensor, read-only)
+  // --------------------------------------------------------------------------
+  snprintf(topic, sizeof(topic), "homeassistant/binary_sensor/%s/relay/config", haDeviceId.c_str());
+  n = snprintf(payload, sizeof(payload),
+      "{\"name\":\"Relais\",\"uniq_id\":\"%s_relay\",\"stat_t\":\"%s/relay\","
+      "\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"ic\":\"mdi:radiator\",%s,%s}",
+      haDeviceId.c_str(), mqtt_topic_base.c_str(), avail.c_str(), dev.c_str());
+  if (n < 0 || (size_t)n >= sizeof(payload)) DPRINTLN("WARNUNG: HA-Discovery-Payload 'relay' abgeschnitten!");
+  mqttClient.publish(topic, payload, true);
+
+  // --------------------------------------------------------------------------
+  // Entity: Solltemperatur (number, lesend + schreibend, °C)
+  // --------------------------------------------------------------------------
+  snprintf(topic, sizeof(topic), "homeassistant/number/%s/temp_soll/config", haDeviceId.c_str());
+  n = snprintf(payload, sizeof(payload),
+      "{\"name\":\"Solltemperatur\",\"uniq_id\":\"%s_temp_soll\","
+      "\"stat_t\":\"%s/temp_soll\",\"cmd_t\":\"%s/set_temp_soll\","
+      "\"unit_of_meas\":\"°C\",\"min\":20,\"max\":60,\"step\":1,\"mode\":\"box\",%s,%s}",
+      haDeviceId.c_str(), mqtt_topic_base.c_str(), mqtt_topic_base.c_str(), avail.c_str(), dev.c_str());
+  if (n < 0 || (size_t)n >= sizeof(payload)) DPRINTLN("WARNUNG: HA-Discovery-Payload 'temp_soll' abgeschnitten!");
+  mqttClient.publish(topic, payload, true);
+
+  // --------------------------------------------------------------------------
+  // Entity: Ist-Temperatur (sensor, read-only, °C)
+  // --------------------------------------------------------------------------
+  snprintf(topic, sizeof(topic), "homeassistant/sensor/%s/temp_ist/config", haDeviceId.c_str());
+  n = snprintf(payload, sizeof(payload),
+      "{\"name\":\"Ist-Temperatur\",\"uniq_id\":\"%s_temp_ist\","
+      "\"stat_t\":\"%s/temp_ist\",\"unit_of_meas\":\"°C\",\"dev_cla\":\"temperature\",%s,%s}",
+      haDeviceId.c_str(), mqtt_topic_base.c_str(), avail.c_str(), dev.c_str());
+  if (n < 0 || (size_t)n >= sizeof(payload)) DPRINTLN("WARNUNG: HA-Discovery-Payload 'temp_ist' abgeschnitten!");
+  mqttClient.publish(topic, payload, true);
+
+  // --------------------------------------------------------------------------
+  // Entity: Solllaufzeit (number, lesend + schreibend, Anzeige in Minuten)
+  // Rohtopics bleiben in ms; cmd_t erwartet weiterhin Minuten (siehe
+  // mqttCallback()), val_tpl rechnet den ms-Statuswert fuer die Anzeige um.
+  // --------------------------------------------------------------------------
+  snprintf(topic, sizeof(topic), "homeassistant/number/%s/laufzeit_soll/config", haDeviceId.c_str());
+  n = snprintf(payload, sizeof(payload),
+      "{\"name\":\"Solllaufzeit\",\"uniq_id\":\"%s_laufzeit_soll\","
+      "\"stat_t\":\"%s/sollLaufzeit\",\"val_tpl\":\"{{ (value | int / 60000) | round(0) }}\","
+      "\"cmd_t\":\"%s/set_laufzeit\",\"unit_of_meas\":\"min\",\"dev_cla\":\"duration\","
+      "\"min\":0,\"max\":5940,\"step\":1,\"mode\":\"box\",%s,%s}",
+      haDeviceId.c_str(), mqtt_topic_base.c_str(), mqtt_topic_base.c_str(), avail.c_str(), dev.c_str());
+  if (n < 0 || (size_t)n >= sizeof(payload)) DPRINTLN("WARNUNG: HA-Discovery-Payload 'laufzeit_soll' abgeschnitten!");
+  mqttClient.publish(topic, payload, true);
+
+  // --------------------------------------------------------------------------
+  // Entity: Restlaufzeit (sensor, read-only, Anzeige in Minuten)
+  // --------------------------------------------------------------------------
+  snprintf(topic, sizeof(topic), "homeassistant/sensor/%s/laufzeit_rest/config", haDeviceId.c_str());
+  n = snprintf(payload, sizeof(payload),
+      "{\"name\":\"Restlaufzeit\",\"uniq_id\":\"%s_laufzeit_rest\","
+      "\"stat_t\":\"%s/restLaufzeit\",\"val_tpl\":\"{{ (value | int / 60000) | round(0) }}\","
+      "\"unit_of_meas\":\"min\",\"dev_cla\":\"duration\",%s,%s}",
+      haDeviceId.c_str(), mqtt_topic_base.c_str(), avail.c_str(), dev.c_str());
+  if (n < 0 || (size_t)n >= sizeof(payload)) DPRINTLN("WARNUNG: HA-Discovery-Payload 'laufzeit_rest' abgeschnitten!");
+  mqttClient.publish(topic, payload, true);
+
+  DPRINTLN("HA Discovery: Config-Nachrichten veroeffentlicht");
 }
 
 // ============================================================================
