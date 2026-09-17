@@ -69,7 +69,7 @@
 // ============================================================================
 // Debugging, für Produktivsystem erste Zeile (#define DEBUG) auskommentieren
 // ============================================================================
-  #define DEBUG
+  //#define DEBUG
   #ifdef DEBUG
     #define DBEGIN() do { Serial.begin(115200); delay(100); } while(0)
     #define DPRINT(...) Serial.print(__VA_ARGS__)
@@ -342,7 +342,7 @@ void setup() {
   // TFT-Display initialisieren
   // --------------------------------------------------------------------------
   tft.begin();
-  tft.setRotation(1);                // Querformat
+  tft.setRotation(3);                // Querformat, um 180° gedreht (neues Gehäuse)
   
   // --------------------------------------------------------------------------
   // LVGL (Grafik-Bibliothek) initialisieren
