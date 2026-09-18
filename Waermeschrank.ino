@@ -44,6 +44,14 @@
  *
  * Change log
  *
+ * v1.3.1 - 2026-09-18 - Display Self-Heal gegen sporadisches Bildrauschen:
+ *                       zwei Full-Redraws kurz nach dem Boot (3s/8s) plus
+ *                       periodischer Full-Redraw alle 3 Minuten waehrend
+ *                       der Laufzeit (deckt auch spaeter auftretende
+ *                       SPI-Korruption einzelner Partial-Updates ab, nicht
+ *                       nur den initialen Boot-Flush), SPI_FREQUENCY der
+ *                       TFT_eSPI-Lib von 27 auf 20 MHz gesenkt (mehr
+ *                       Stoerabstand auf der Breadboard-Verkabelung)
  * v1.3.0 - 2026-09-17 - Taster-Debounce ueberarbeitet (ISR-Timestamp statt
  *                       Race-anfaelligem digitalRead), MQTT-Connect-Timeout
  *                       (2s), non-blocking WiFi-Reconnect, lv_refr_now/
@@ -500,7 +508,35 @@ void loop() {
 
   lv_task_handler();                  // LVGL Tasks verarbeiten
   delay(5);                           // Kurze Pause für Task-Scheduler
-  
+
+  // --------------------------------------------------------------------------
+  // Display Self-Heal: SPI-Störungen (z.B. durch die Breadboard-Verkabelung)
+  // können nicht nur den initialen Full-Redraw beim Boot korrumpieren,
+  // sondern auch einzelne spätere Partial-Updates - beobachtet z.B. als
+  // grün eingefärbte Flächen, die deutlich größer sind als das eigentlich
+  // aktualisierte Element (blink_dot/Ist-Temperatur-Farbe sind grün). Das
+  // deutet auf ein gekipptes Bit im SPI-Kommando für das Adressfenster
+  // (setAddrWindow) hin, wodurch zu viele Pixel mit der falschen Farbe
+  // beschrieben werden. Da LVGL nur geänderte Bereiche neu zeichnet, bleibt
+  // so ein Fehler stehen, bis das betroffene Element zufällig erneut
+  // aktualisiert wird. Um das zu heilen, wird der komplette Screen zweimal
+  // kurz nach dem Start (3s/8s, deckt den Boot-Flush ab) und danach
+  // periodisch (alle 3 Minuten, deckt spätere Laufzeit-Korruption ab) neu
+  // invalidiert und komplett über SPI neu übertragen.
+  // --------------------------------------------------------------------------
+  static unsigned long nextSelfHeal = 3000;
+  static uint8_t selfHealBootStage = 0;
+  const unsigned long selfHealRuntimeInterval = 3UL * 60UL * 1000UL; // alle 3 Minuten
+  if (now >= nextSelfHeal) {
+    lv_obj_invalidate(lv_scr_act());
+    if (selfHealBootStage == 0) {
+      nextSelfHeal = 8000;
+      selfHealBootStage = 1;
+    } else {
+      nextSelfHeal = now + selfHealRuntimeInterval;
+    }
+  }
+
   // --------------------------------------------------------------------------
   // DS18B20 Temperaturmessung (non-blocking)
   // --------------------------------------------------------------------------
